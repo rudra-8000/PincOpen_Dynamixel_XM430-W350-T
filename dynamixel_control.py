@@ -21,8 +21,8 @@ import dynamixel_sdk as dxl
 # Hardware Configuration  (edit to match your setup)
 # ──────────────────────────────────────────────
 DEVICE_PORT  = '/dev/ttyUSB0'   # Linux. Windows: 'COM3', macOS: '/dev/tty.usbserial-*'
-BAUD_RATE    = 57600
-DXL_ID       = 1
+BAUD_RATE    = 1000000
+DXL_ID       = 0
 PROTOCOL_VER = 2.0
 
 # ──────────────────────────────────────────────
@@ -46,14 +46,16 @@ MAX_CURRENT_UNITS        = 1193  # default Current Limit (addr 38); unit ≈ 2.6
 # ──────────────────────────────────────────────
 # Motor Constants
 # ──────────────────────────────────────────────
-TORQUE_ENABLE       = 1
-TORQUE_DISABLE      = 0
-POSITION_MODE       = 3           # Operating Mode value for Position Control
-POS_RESOLUTION      = 4096        # Ticks per full revolution (0.088 deg/tick)
-MAX_PROFILE_VEL     = 200         # ~45.8 rpm @ 0.229 rpm/unit (motor max: 46 rpm @ 12V)
-POSITION_TOLERANCE  = 10          # Acceptable tick error to consider motion complete
-MOTION_TIMEOUT_S    = 10.0        # Max seconds to wait for movement to complete
-POLL_INTERVAL_S     = 0.02        # Seconds between "is it still moving?" polls
+TORQUE_ENABLE          = 1
+TORQUE_DISABLE         = 0
+CURRENT_BASED_POS_MODE = 5        # Operating Mode 5: Current-Based Position Control
+POS_RESOLUTION         = 4096     # Ticks per revolution (0.088 deg/tick)
+MAX_PROFILE_VEL        = 200      # ~45.8 rpm @ 0.229 rpm/unit
+MAX_CURRENT_UNITS      = 1193     # Default Current Limit; 1 unit ≈ 2.69 mA
+POSITION_TOLERANCE     = 15       # Ticks; generous for current-based mode
+MOTION_TIMEOUT_S       = 10.0
+MOVING_ARM_TIMEOUT_S   = 0.25     # Max time to wait for MOVING to go 1 after goal write
+POLL_INTERVAL_S        = 0.02
 
 
 # ─────────────────────────────────────────────
@@ -83,6 +85,51 @@ def _check_comm(result: int, error: int, packet_handler, label: str) -> bool:
         # Hardware error is non-fatal for motion; return True but flag it.
     return True
 
+def _wait_for_motion_complete(port_handler, packet_handler, dxl_id: int, goal_ticks: int) -> bool:
+    """
+    Two-phase motion wait to avoid the MOVING-flag race condition.
+
+    Phase 1 — Arm wait:
+        After writing Goal Position, the motor needs a few ms to load its
+        trajectory profile. During this window MOVING = 0 (false idle).
+        We wait up to MOVING_ARM_TIMEOUT_S for MOVING to go HIGH (= 1),
+        indicating the trajectory has actually started.
+
+    Phase 2 — Completion wait:
+        Once MOVING is confirmed HIGH (or we timed out phase 1 and the
+        motor is a short move that finished before we could catch it),
+        we wait for MOVING to go LOW again.
+
+    Returns True if motion completed, False on comms error or timeout.
+    """
+    # ── Phase 1: wait for MOVING → 1 ──────────────────────────────────────
+    arm_deadline = time.time() + MOVING_ARM_TIMEOUT_S
+    while time.time() < arm_deadline:
+        moving, res, err = packet_handler.read1ByteTxRx(
+            port_handler, dxl_id, ADDR_MOVING
+        )
+        if not _check_comm(res, err, packet_handler, "Read MOVING (arm)"):
+            return False
+        if moving == 1:
+            break
+        time.sleep(POLL_INTERVAL_S)
+    # Note: if phase 1 times out, the move may be tiny and already done — that's fine.
+
+    # ── Phase 2: wait for MOVING → 0 ──────────────────────────────────────
+    deadline = time.time() + MOTION_TIMEOUT_S
+    while time.time() < deadline:
+        moving, res, err = packet_handler.read1ByteTxRx(
+            port_handler, dxl_id, ADDR_MOVING
+        )
+        if not _check_comm(res, err, packet_handler, "Read MOVING (complete)"):
+            return False
+        if moving == 0:
+            return True
+        time.sleep(POLL_INTERVAL_S)
+
+    print(f"[ERROR] Motion timeout ({MOTION_TIMEOUT_S}s) exceeded.")
+    return False
+
 
 # ─────────────────────────────────────────────
 # Main gripper control function
@@ -101,8 +148,8 @@ def control_gripper(
     angle: float,
     speed: float  = 1.0,
     torque: float = 1.0,          # NEW — fraction of max current [0.0, 1.0]
-    open_angle: float  = 10.0,
-    close_angle: float = 100.0,
+    open_angle: float  = 285.0,
+    close_angle: float = 166.0,
     port: str  = DEVICE_PORT,
     baud: int  = BAUD_RATE,
     dxl_id: int = DXL_ID,
@@ -247,6 +294,16 @@ def control_gripper(
             return 0
 
         # ── Verify final position ──────────────────────────────────────────
+        # present_ticks, res, err = packet_handler.read4ByteTxRx(
+        #     port_handler, dxl_id, ADDR_PRESENT_POSITION
+        # )
+        # if not _check_comm(res, err, packet_handler, "Read present position"):
+        #     port_handler.closePort()
+        #     return 0
+        if not _wait_for_motion_complete(port_handler, packet_handler, dxl_id, goal_ticks):
+            port_handler.closePort()
+            return 0
+
         present_ticks, res, err = packet_handler.read4ByteTxRx(
             port_handler, dxl_id, ADDR_PRESENT_POSITION
         )
@@ -287,35 +344,43 @@ def control_gripper(
 
 class GripperController:
     """
-    Maintains a persistent port connection for repeated gripper calls.
-    Use this in your robot pipeline to avoid re-opening the port every step.
+    Persistent-connection gripper controller with torque (current) control.
+
+    Uses Current-Based Position Mode (mode 5) which simultaneously controls
+    position trajectory AND limits the maximum current, enabling compliant grasps.
 
     Usage:
-        gripper = GripperController()
-        gripper.open()
-        status = gripper.move(45.0, speed=0.5)
-        gripper.close_connection()
+        with GripperController(open_angle=285.0, close_angle=166.0) as g:
+            g.open(speed=0.8)
+            g.move(240.0, speed=0.5, torque=0.4)
+            g.close(speed=1.0, torque=0.6)
     """
 
     def __init__(
         self,
-        port: str = DEVICE_PORT,
-        baud: int = BAUD_RATE,
+        port: str   = DEVICE_PORT,
+        baud: int   = BAUD_RATE,
         dxl_id: int = DXL_ID,
-        open_angle: float = 10.0,
-        close_angle: float = 100.0,
+        open_angle:  float = 285.0,
+        close_angle: float = 166.0,
+        default_speed:  float = 1.0,   # used by open() / close() if not overridden
+        default_torque: float = 1.0,   # used by open() / close() if not overridden
     ):
-        self.port        = port
-        self.baud        = baud
-        self.dxl_id      = dxl_id
-        self.open_angle  = open_angle
-        self.close_angle = close_angle
-        self._connected  = False
+        self.port           = port
+        self.baud           = baud
+        self.dxl_id         = dxl_id
+        self.open_angle     = open_angle
+        self.close_angle    = close_angle
+        self.default_speed  = max(0.01, min(1.0, default_speed))
+        self.default_torque = max(0.01, min(1.0, default_torque))
+        self._connected     = False
 
         self.port_handler   = dxl.PortHandler(port)
         self.packet_handler = dxl.PacketHandler(PROTOCOL_VER)
 
         self._connect()
+
+    # ── Internal ────────────────────────────────────────────────────────────
 
     def _connect(self):
         if not self.port_handler.openPort():
@@ -323,66 +388,92 @@ class GripperController:
         if not self.port_handler.setBaudRate(self.baud):
             raise IOError(f"Cannot set baud rate: {self.baud}")
 
-        # Torque off → set mode → torque on (done once at init)
-        for addr, val, label in [
-            (ADDR_TORQUE_ENABLE, TORQUE_DISABLE, "torque off"),
-            (ADDR_OPERATING_MODE, POSITION_MODE,  "position mode"),
-            (ADDR_TORQUE_ENABLE, TORQUE_ENABLE,   "torque on"),
+        # One-time EEPROM init: mode → RAM: profile vel + torque on
+        for addr, val, nbytes, label in [
+            (ADDR_TORQUE_ENABLE,   TORQUE_DISABLE,          1, "torque off"),
+            (ADDR_OPERATING_MODE,  CURRENT_BASED_POS_MODE,  1, "current-based pos mode"),
+            (ADDR_TORQUE_ENABLE,   TORQUE_ENABLE,            1, "torque on"),
         ]:
-            res, err = self.packet_handler.write1ByteTxRx(
-                self.port_handler, self.dxl_id, addr, val
-            )
+            write_fn = (self.packet_handler.write1ByteTxRx if nbytes == 1
+                        else self.packet_handler.write4ByteTxRx)
+            res, err = write_fn(self.port_handler, self.dxl_id, addr, val)
             if not _check_comm(res, err, self.packet_handler, label):
                 raise RuntimeError(f"Init failed at: {label}")
 
         self._connected = True
-        print(f"[INFO]  GripperController connected on {self.port}")
+        print(f"[INFO]  GripperController connected — {self.port} @ {self.baud} baud "
+              f"| ID={self.dxl_id} | mode=Current-Based Position (5)")
 
-    def move(self, angle: float, speed: float = 1.0) -> int:
-        """Move gripper to angle (°). Returns 1 on success, 0 on failure."""
+    def _write4(self, addr: int, val: int, label: str) -> bool:
+        res, err = self.packet_handler.write4ByteTxRx(
+            self.port_handler, self.dxl_id, addr, val)
+        return _check_comm(res, err, self.packet_handler, label)
+
+    def _write2(self, addr: int, val: int, label: str) -> bool:
+        res, err = self.packet_handler.write2ByteTxRx(
+            self.port_handler, self.dxl_id, addr, val)
+        return _check_comm(res, err, self.packet_handler, label)
+
+    def _write1(self, addr: int, val: int, label: str) -> bool:
+        res, err = self.packet_handler.write1ByteTxRx(
+            self.port_handler, self.dxl_id, addr, val)
+        return _check_comm(res, err, self.packet_handler, label)
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    def move(
+        self,
+        angle: float,
+        speed: float  = None,   # None → uses self.default_speed
+        torque: float = None,   # None → uses self.default_torque
+    ) -> int:
+        """
+        Move gripper to angle (°).
+
+        Args:
+            angle  : Target angle in degrees, clamped to [open_angle, close_angle].
+            speed  : Speed fraction [0.01, 1.0]. Defaults to self.default_speed.
+            torque : Current limit fraction [0.01, 1.0]. Defaults to self.default_torque.
+                     Lower = less force = safer for delicate objects.
+                     e.g. torque=0.3 → ~960 mA → ~0.35 Nm holding torque.
+
+        Returns:
+            1 on success, 0 on failure.
+        """
         if not self._connected:
             print("[ERROR] Not connected.")
             return 0
 
+        speed  = self.default_speed  if speed  is None else max(0.01, min(1.0, speed))
+        torque = self.default_torque if torque is None else max(0.01, min(1.0, torque))
+
         lo = min(self.open_angle, self.close_angle)
         hi = max(self.open_angle, self.close_angle)
-        angle  = max(lo, min(hi, angle))
-        speed  = max(0.01, min(1.0, speed))
+        angle = max(lo, min(hi, angle))
 
-        goal_ticks  = _degrees_to_ticks(angle)
-        profile_vel = max(1, int(round(speed * MAX_PROFILE_VEL)))
+        goal_ticks   = _degrees_to_ticks(angle)
+        profile_vel  = max(1, int(round(speed  * MAX_PROFILE_VEL)))
+        goal_current = max(1, min(MAX_CURRENT_UNITS, int(round(torque * MAX_CURRENT_UNITS))))
+
+        print(f"[INFO]  → {angle:.1f}° ({goal_ticks} ticks) | "
+              f"spd={speed:.2f} ({profile_vel} units) | "
+              f"τ={torque:.2f} ({goal_current} units ≈ {goal_current*2.69:.0f} mA)")
 
         try:
-            # Set profile velocity
-            res, err = self.packet_handler.write4ByteTxRx(
-                self.port_handler, self.dxl_id, ADDR_PROFILE_VEL, profile_vel
-            )
-            if not _check_comm(res, err, self.packet_handler, "Set profile velocity"):
+            if not self._write4(ADDR_PROFILE_VEL,  profile_vel,  "Set profile velocity"):
+                return 0
+            if not self._write2(ADDR_GOAL_CURRENT,  goal_current, "Set goal current"):
+                return 0
+            if not self._write4(ADDR_GOAL_POSITION, goal_ticks,   "Write goal position"):
                 return 0
 
-            # Write goal position
-            res, err = self.packet_handler.write4ByteTxRx(
-                self.port_handler, self.dxl_id, ADDR_GOAL_POSITION, goal_ticks
-            )
-            if not _check_comm(res, err, self.packet_handler, "Write goal position"):
+            # ── Two-phase wait (fixes MOVING-flag race condition) ────────────
+            if not _wait_for_motion_complete(
+                self.port_handler, self.packet_handler, self.dxl_id, goal_ticks
+            ):
                 return 0
 
-            # Wait for motion
-            deadline = time.time() + MOTION_TIMEOUT_S
-            while time.time() < deadline:
-                moving, res, err = self.packet_handler.read1ByteTxRx(
-                    self.port_handler, self.dxl_id, ADDR_MOVING
-                )
-                if not _check_comm(res, err, self.packet_handler, "Read MOVING"):
-                    return 0
-                if moving == 0:
-                    break
-                time.sleep(POLL_INTERVAL_S)
-            else:
-                print("[ERROR] Motion timeout.")
-                return 0
-
-            # Verify
+            # ── Verify final position ────────────────────────────────────────
             present_ticks, res, err = self.packet_handler.read4ByteTxRx(
                 self.port_handler, self.dxl_id, ADDR_PRESENT_POSITION
             )
@@ -390,30 +481,44 @@ class GripperController:
                 return 0
 
             present_ticks = present_ticks & 0xFFFFFFFF
-            if abs(present_ticks - goal_ticks) > POSITION_TOLERANCE:
-                print(f"[ERROR] Position mismatch: {present_ticks} vs {goal_ticks}")
-                return 0
+            tick_error    = abs(present_ticks - goal_ticks)
 
+            # In current-based mode the motor may stop slightly before the
+            # goal if torque is low and friction is high — widen tolerance
+            # or skip the position check if you're using torque for compliance.
+            if tick_error > POSITION_TOLERANCE:
+                print(f"[WARN]  Position offset: goal={goal_ticks} "
+                      f"({angle:.1f}°), present={present_ticks} "
+                      f"({_ticks_to_degrees(present_ticks):.1f}°), "
+                      f"Δ={tick_error} ticks — may be torque-limited contact.")
+                # Still return 1: reaching the torque limit IS a valid grasp event
+                return 1
+
+            print(f"[OK]    Reached {_ticks_to_degrees(present_ticks):.1f}° "
+                  f"(Δ {tick_error} ticks = {tick_error*360/POS_RESOLUTION:.2f}°)")
             return 1
 
         except Exception as exc:
             print(f"[EXCEPTION] {exc}")
             return 0
 
-    def open(self, speed: float = 1.0) -> int:
-        """Move to the fully open position."""
-        return self.move(self.open_angle, speed=speed)
+    def open(self, speed: float = None, torque: float = None) -> int:
+        """Move to fully open position."""
+        return self.move(self.open_angle, speed=speed, torque=torque)
 
-    def close(self, speed: float = 1.0) -> int:
-        """Move to the fully closed position."""
-        return self.move(self.close_angle, speed=speed)
+    def close(self, speed: float = None, torque: float = None) -> int:
+        """Move to fully closed position."""
+        return self.move(self.close_angle, speed=speed, torque=torque)
+
+    def set_defaults(self, speed: float = None, torque: float = None):
+        """Update the default speed and/or torque for subsequent calls."""
+        if speed  is not None: self.default_speed  = max(0.01, min(1.0, speed))
+        if torque is not None: self.default_torque = max(0.01, min(1.0, torque))
 
     def close_connection(self):
-        """Disable torque and close the serial port."""
+        """Disable torque and release the serial port."""
         if self._connected:
-            self.packet_handler.write1ByteTxRx(
-                self.port_handler, self.dxl_id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE
-            )
+            self._write1(ADDR_TORQUE_ENABLE, TORQUE_DISABLE, "torque off (shutdown)")
             self.port_handler.closePort()
             self._connected = False
             print("[INFO]  GripperController disconnected.")
@@ -425,20 +530,29 @@ class GripperController:
         self.close_connection()
 
 
+
 # ─────────────────────────────────────────────
 # Example usage
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
 
-    # ── Option A: Simple one-shot function call ────────────────────────────
-    result = control_gripper(50.0, speed=0.6)
-    print("Result:", result)   # 1 = success, 0 = failure
+    # # ── Option A: Simple one-shot function call ────────────────────────────
+    # result = control_gripper(170.0, speed=0.8)
+    # print("Result:", result)   # 1 = success, 0 = failure
 
     # ── Option B: Persistent class (recommended for robot pipelines) ────────
-    with GripperController(open_angle=10.0, close_angle=100.0) as gripper:
-        gripper.open(speed=0.8)
-        time.sleep(0.5)
-        gripper.move(55.0, speed=0.5)   # mid-grasp
-        time.sleep(0.5)
-        gripper.close(speed=1.0)
+    # with GripperController(open_angle=285.0, close_angle=166.0) as gripper:
+    #     gripper.open(speed=0.8)
+    #     time.sleep(1)
+    #     gripper.move(240.0, speed=0.8)   # mid-grasp
+    #     time.sleep(1)
+    #     gripper.close(speed=1.0)
+    #     time.sleep(1)
+
+    gripper= GripperController(open_angle=285.0, close_angle=166.0, default_speed=0.2, default_torque=0.5)
+    for i in range(10):
+        gripper.open()
+        gripper.move(240.0)   # mid-grasp
+        gripper.close()
+    gripper.close_connection()

@@ -50,10 +50,11 @@ A wrist-mounted Intel RealSense D435i camera attachment is included with an adju
 | 8 | M3 Bolts (assorted) |
 | 9 | M2.5 Bolts (assorted) |
 | 10 | Bushings: 3 (ID) × 6 (OD) × 5 mm (L) |
+| 11 | Something else which i may have forgotten |
 
 ## STL and SolidWorks Files
 
-SLDPRT, SLDASM, STL, and STEP files can be found [here](https://github.com/rudra-8000/PincOpen_Dynamixel_XM430-W350-T/tree/main/cad).
+SLDPRT, SLDASM, and STL files can be found [here](https://github.com/rudra-8000/PincOpen_Dynamixel_XM430-W350-T/tree/main/cad).
 Files were edited from the original PincOpen STEP files using SolidWorks.
 
 ## Assembly Guide

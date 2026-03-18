@@ -202,6 +202,7 @@ def control_gripper(
     # ── Open port ──────────────────────────────────────────────────────────
     port_handler   = dxl.PortHandler(port)
     packet_handler = dxl.PacketHandler(PROTOCOL_VER)
+    print(port)
 
     try:
         if not port_handler.openPort():

@@ -1,5 +1,5 @@
 # Pinc'Open with a Dynamixel XM430-W350-T
-This project is FORK of the amazing [Pinc'Open Project](https://github.com/pollen-robotics/PincOpen/tree/main), only difference being that the design files have been modified to use a Dynamixel XM430-W350-T for driving the gripper. Also a change of using a 25mm dowel instead of a 24mm one (because of availability).
+This project is FORK of the amazing [Pinc'Open Project](https://github.com/pollen-robotics/PincOpen/tree/main), only difference being that the design files have been modified to use a **Dynamixel XM430-W350-T** for driving the gripper. Also a few slight design changes like using a 25mm dowel instead of a 24mm one (because of availability).
 
 ## Table of contents
 - [Pinc'Open with a Dynamixel XM430-W350-T](#pincopen-with-a-dynamixel-xm430-w350-t)
@@ -7,8 +7,8 @@ This project is FORK of the amazing [Pinc'Open Project](https://github.com/polle
 - [About the project](#about-the-project)
 - [Build Resources](#build-resources)
   - [BOM (Bill Of Materials)](#bom-bill-of-materials)
-  - [STL Files and Onshape document](#stl-files-and-onshape-document)
-  - [Configure the motor before assembly](#configure-the-motor-before-assembly)
+  - [STL and SolidWorks Files](#stl-and-solidworks-files)
+  - [Configure the motor before assembly and control via python](#configure-the-motor-before-assembly-and-control-via-python)
   - [Assembly Guide](#assembly-guide)
 
 
@@ -18,7 +18,7 @@ This project is FORK of the amazing [Pinc'Open Project](https://github.com/polle
 
 
 # About the project
-Made out of necessity and availability of resources. Also added some extra attachments to allow mounting an Intel RealSense D435i camera to act as a wrist mounted camera. The angle of this camera is adjustable.
+Made out of necessity and availability of resources. Also added some extra attachments to allow mounting an Intel **RealSense D435i camera** to act as a wrist mounted camera. The angle of this camera is adjustable.
 I've also designed a custom 2 part mount which allows the gripper to be securely mounted to a UR10 (I believe the same can be used for the UR5 and UR3).
 
 # Build Resources
@@ -34,18 +34,18 @@ The list of all needed components:
 7. Threaded Inserts M3 * 4.2mm (OD) * 5mm (Length)  x 4
 8. M3 Bolts
 9. M2.5 Bolts
-10. Bushings: 3(ID)x6(OD)x5(L)
+10. Bushings: 3(ID)* 6(OD) * 5(L)
 11. something else which i may have forgotten
 
 
-## STL Files and Onshape document
+## STL and SolidWorks Files
 SLDPRT, SLDASM, STL and Steps files can be found [here](https://github.com/rudra-8000/PincOpen_Dynamixel_XM430-W350-T/tree/main/cad)  
 
 I've edited the step files provided by the original creators using SolidWorks.  
 
 
 
-## Configure the motor before assembly
+## Configure the motor before assembly and control via python
 You can use the dynamixel wizard to configure the motor to your needs. We use a U2D2 and a U2D2 Power Hub to interface with the motor.
 
 I've also written a function 
